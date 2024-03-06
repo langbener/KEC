@@ -1,0 +1,995 @@
+import numpy
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.autograd import Variable
+import numpy as np
+import math
+from code.common_layer import EncoderLayer, DecoderLayer, MultiHeadAttention, Conv, PositionwiseFeedForward, LayerNorm, \
+    _gen_bias_mask, _gen_timing_signal, share_embedding, LabelSmoothing, NoamOpt, _get_attn_subsequent_mask
+import random
+# from numpy import random
+import os
+import pprint
+from tqdm import tqdm
+
+pp = pprint.PrettyPrinter(indent=1)
+import os
+import time
+from copy import deepcopy
+from sklearn.metrics import accuracy_score
+import pdb
+
+
+torch.manual_seed(0)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+np.random.seed(0)
+
+
+class Encoder(nn.Module):
+    """
+    A Transformer Encoder module. 
+    Inputs should be in the shape [batch_size, length, hidden_size]
+    Outputs will have the shape [batch_size, length, hidden_size]
+    Refer Fig.1 in https://arxiv.org/pdf/1706.03762.pdf
+    """
+
+    def __init__(self, args, embedding_size, hidden_size, num_layers, num_heads, total_key_depth, total_value_depth,
+                 filter_size, max_length=1000, input_dropout=0.0, layer_dropout=0.0,
+                 attention_dropout=0.0, relu_dropout=0.0, use_mask=False, universal=False, concept=False):
+        """
+        Parameters:
+            embedding_size: Size of embeddings
+            hidden_size: Hidden size
+            num_layers: Total layers in the Encoder  2
+            num_heads: Number of attention heads   2
+            total_key_depth: Size of last dimension of keys. Must be divisible by num_head   40
+            total_value_depth: Size of last dimension of values. Must be divisible by num_head  40
+            output_depth: Size last dimension of the final output
+            filter_size: Hidden size of the middle layer in FFN  50
+            max_length: Max sequence length (required for timing signal)
+            input_dropout: Dropout just after embedding
+            layer_dropout: Dropout for each layer
+            attention_dropout: Dropout probability after attention (Should be non-zero only during training)
+            relu_dropout: Dropout probability after relu in FFN (Should be non-zero only during training)
+            use_mask: Set to True to turn on future value masking
+        """
+
+        super(Encoder, self).__init__()
+        self.args = args
+        self.universal = universal
+        self.num_layers = num_layers
+        self.timing_signal = _gen_timing_signal(max_length, hidden_size)
+
+        if (self.universal):
+            ## for t
+            self.position_signal = _gen_timing_signal(num_layers, hidden_size)
+
+        params = (hidden_size,
+                  total_key_depth or hidden_size,
+                  total_value_depth or hidden_size,
+                  filter_size,
+                  num_heads,
+                  _gen_bias_mask(max_length) if use_mask else None,
+                  layer_dropout,
+                  attention_dropout,
+                  relu_dropout)
+
+        self.embedding_proj = nn.Linear(embedding_size, hidden_size, bias=False)
+        if (self.universal):
+            self.enc = EncoderLayer(*params)
+        else:
+            self.enc = nn.ModuleList([EncoderLayer(*params) for _ in range(num_layers)])
+
+        self.layer_norm = LayerNorm(hidden_size)
+        self.input_dropout = nn.Dropout(input_dropout)
+
+    def forward(self, inputs, mask):
+        # Add input dropout
+        x = self.input_dropout(inputs)
+
+        # Project to hidden size
+        x = self.embedding_proj(x)
+
+        if (self.universal):
+            if (self.args.act):  # Adaptive Computation Time
+                x, (self.remainders, self.n_updates) = self.act_fn(x, inputs, self.enc, self.timing_signal,
+                                                                   self.position_signal, self.num_layers)
+                y = self.layer_norm(x)
+            else:
+                for l in range(self.num_layers):
+                    x += self.timing_signal[:, :inputs.shape[1], :].type_as(inputs.data)
+                    x += self.position_signal[:, l, :].unsqueeze(1).repeat(1, inputs.shape[1], 1).type_as(inputs.data)
+                    x = self.enc(x, mask=mask)
+                y = self.layer_norm(x)
+        else:
+            # Add timing signal
+            x += self.timing_signal[:, :inputs.shape[1], :].type_as(inputs.data)
+
+            for i in range(self.num_layers):
+                # print(len(self.enc))
+                x = self.enc[i](x, mask)
+
+            y = self.layer_norm(x)
+        return y
+
+
+class Decoder(nn.Module):
+    """
+    A Transformer Decoder module. 
+    Inputs should be in the shape [batch_size, length, hidden_size]
+    Outputs will have the shape [batch_size, length, hidden_size]
+    Refer Fig.1 in https://arxiv.org/pdf/1706.03762.pdf
+    """
+
+    def __init__(self, args, embedding_size, hidden_size, num_layers, num_heads, total_key_depth, total_value_depth,
+                 filter_size, max_length=1000, input_dropout=0.0, layer_dropout=0.0,
+                 attention_dropout=0.0, relu_dropout=0.0, universal=False):
+        """
+        300,40,40
+        self.decoder = Decoder(args, args.emb_dim, hidden_size=args.hidden_dim, num_layers=args.hop,
+                               num_heads=args.heads,
+                               total_key_depth=args.depth, total_value_depth=args.depth, filter_size=args.filter,
+                               max_length=args.max_seq_length, )
+
+        Parameters:
+            embedding_size: Size of embeddings
+            hidden_size: Hidden size
+            num_layers: Total layers in the Encoder
+            num_heads: Number of attention heads
+            total_key_depth: Size of last dimension of keys. Must be divisible by num_head
+            total_value_depth: Size of last dimension of values. Must be divisible by num_head
+            output_depth: Size last dimension of the final output
+            filter_size: Hidden size of the middle layer in FFN
+            max_length: Max sequence length (required for timing signal)
+            input_dropout: Dropout just after embedding
+            layer_dropout: Dropout for each layer
+            attention_dropout: Dropout probability after attention (Should be non-zero only during training)
+            relu_dropout: Dropout probability after relu in FFN (Should be non-zero only during training)
+        """
+
+        super(Decoder, self).__init__()
+        self.args = args
+        self.universal = universal
+        self.num_layers = num_layers
+        self.timing_signal = _gen_timing_signal(max_length, hidden_size)
+
+        if (self.universal):
+            ## for t
+            self.position_signal = _gen_timing_signal(num_layers, hidden_size)
+
+        self.mask = _get_attn_subsequent_mask(self.args, max_length)
+
+        params = (args,
+                  hidden_size,
+                  total_key_depth or hidden_size,
+                  total_value_depth or hidden_size,
+                  filter_size,
+                  num_heads,
+                  _gen_bias_mask(max_length),  # mandatory
+                  layer_dropout,
+                  attention_dropout,
+                  relu_dropout)
+
+        if (self.universal):
+            self.dec = DecoderLayer(*params)
+        else:
+            self.dec = nn.Sequential(*[DecoderLayer(*params) for l in range(num_layers)])
+
+        self.embedding_proj = nn.Linear(embedding_size, hidden_size, bias=False)
+        self.layer_norm = LayerNorm(hidden_size)
+        self.input_dropout = nn.Dropout(input_dropout)
+        self.attn_loss = nn.MSELoss()
+
+    def forward(self, inputs, encoder_output, mask=None, pred_emotion=None, emotion_contexts=None, context_vad=None , cog_ref_ctx=None):
+        '''
+        inputs: (bsz, tgt_len)
+        encoder_output: (bsz, src_len), src_len=dialog_len+concept_len
+        mask: (bsz, src_len)
+        pred_emotion: (bdz, emotion_type)
+        emotion_contexts: (bsz, emb_dim)
+        context_vad: (bsz, src_len) emotion intensity values
+        '''
+
+        mask_src, mask_trg = mask
+        dec_mask = torch.gt(mask_trg.bool() + self.mask[:, :mask_trg.size(-1), :mask_trg.size(-1)].bool(), 0)
+        # dec_mask = torch.gt(mask_trg.bool(), 0)
+
+        # Add input dropout
+        x = self.input_dropout(inputs)
+        x = self.embedding_proj(x)
+        loss_att = 0.0
+        attn_dist = None
+        if (self.universal):
+            if (self.args.act):
+                x, attn_dist, (self.remainders, self.n_updates) = self.act_fn(x, inputs, self.dec, self.timing_signal,
+                                                                              self.position_signal, self.num_layers,
+                                                                              encoder_output, decoding=True)
+                y = self.layer_norm(x)
+
+            else:
+                x += self.timing_signal[:, :inputs.shape[1], :].type_as(inputs.data)
+                for l in range(self.num_layers):
+                    x += self.position_signal[:, l, :].unsqueeze(1).repeat(1, inputs.shape[1], 1).type_as(inputs.data)
+
+                    # x, _, pred_emotion, emotion_contexts, attn_dist,cog, _ = self.dec(
+                    #     (x, encoder_output, pred_emotion, emotion_contexts, [],cog_ref_ctx, (mask_src, dec_mask)))
+                    x, _, pred_emotion, emotion_contexts, attn_dist, _ = self.dec(
+                        (x, encoder_output, pred_emotion, emotion_contexts, [], (mask_src, dec_mask)))
+                y = self.layer_norm(x)
+        else:
+            # Add timing signal
+            x += self.timing_signal[:, :inputs.shape[1], :].type_as(inputs.data)
+
+            # Run decoder  y, encoder_outputs, pred_emotion, emotion_contexts, attention_weight, mask
+
+
+            y, _, pred_emotion, emotion_contexts, attn_dist,cog, _ = self.dec(
+                (x, encoder_output, pred_emotion, emotion_contexts, [],cog_ref_ctx, (mask_src, dec_mask)))
+            # y, _, pred_emotion, emotion_contexts, attn_dist, _ = self.dec(
+            #     (x, encoder_output, pred_emotion, emotion_contexts, [], (mask_src, mask_trg)))
+
+            # Emotional attention loss
+            if context_vad is not None:
+                src_attn_dist = torch.mean(attn_dist, dim=1)  # (bsz, src_len)
+                loss_att = self.attn_loss(src_attn_dist, context_vad)
+
+            # Final layer normalization
+            y = self.layer_norm(y)
+
+        return y, attn_dist, loss_att
+
+
+class Generator(nn.Module):
+    "Define standard linear + softmax generation step."
+
+    def __init__(self, args, d_model, vocab):
+        super(Generator, self).__init__()
+        self.args = args
+        self.proj = nn.Linear(d_model, vocab)
+        self.emo_proj = nn.Linear(2 * d_model, vocab)
+        self.p_gen_linear = nn.Linear(self.args.hidden_dim, 1)
+
+    def forward(self, x, pred_emotion=None, emotion_context=None, attn_dist=None, enc_batch_extend_vocab=None,
+                extra_zeros=None, temp=1):
+        # pred_emotion (bsz, 1, embed_dim);  emotion_context: (bsz, emb_dim)
+        if self.args.pointer_gen:
+            p_gen = self.p_gen_linear(x)
+            alpha = torch.sigmoid(p_gen)
+
+        if emotion_context is not None:
+            # emotion_context = emotion_context.unsqueeze(1).repeat(1, x.size(1), 1)
+            pred_emotion = pred_emotion.repeat(1, x.size(1), 1)
+            x = torch.cat((x, pred_emotion), dim=2)  # (bsz, tgt_len, 2 emb_dim)
+            logit = self.emo_proj(x)
+        else:
+            logit = self.proj(x)  # x: (bsz, tgt_len, emb_dim)
+
+        if self.args.pointer_gen:
+            vocab_dist = F.softmax(logit / temp, dim=2)
+            vocab_dist_ = alpha * vocab_dist
+
+            attn_dist = F.softmax(attn_dist / temp, dim=-1)
+            attn_dist_ = (1 - alpha) * attn_dist
+            enc_batch_extend_vocab_ = torch.cat([enc_batch_extend_vocab.unsqueeze(1)] * x.size(1),
+                                                1)  ## extend for all seq
+
+            if extra_zeros is not None:
+                extra_zeros = torch.cat([extra_zeros.unsqueeze(1)] * x.size(1), 1)
+                vocab_dist_ = torch.cat([vocab_dist_, extra_zeros], 2)
+            # if beam_search:
+            #     enc_batch_extend_vocab_ = torch.cat([enc_batch_extend_vocab_[0].unsqueeze(0)]*x.size(0),0) ## extend for all seq
+
+            logit = torch.log(vocab_dist_.scatter_add(2, enc_batch_extend_vocab_, attn_dist_) + 1e-18)
+            return logit
+        else:
+            return F.log_softmax(logit, dim=-1)
+
+
+
+class MLP(nn.Module):
+    def __init__(self):
+        super(MLP, self).__init__()
+        input_num = 4
+        input_dim = input_num * 300
+        hid_num = 3
+        hid_dim = hid_num * 300
+        out_dim = 300
+
+        self.lin_1 = nn.Linear(input_dim, hid_dim, bias=False)
+        self.lin_2 = nn.Linear(hid_dim, out_dim, bias=False)
+
+        self.act = nn.ReLU()
+
+    def forward(self, x):
+        # print('x', x.size())
+        x = self.lin_1(x)
+        x = self.act(x)
+        x = self.lin_2(x)
+        # print('x',x.size())
+        # return x
+
+
+
+class KEC(nn.Module):
+    def __init__(
+            self, args, vocab, decoder_number, model_file_path=None, is_eval=False, load_optim=False):
+        super(KEC, self).__init__()
+        #用于调用父类(超类)的一个方法
+        self.args = args
+        self.vocab = vocab
+        # word2index, word2count, index2word, n_words = vocab
+        word2index = vocab['word2index']
+        word2count = vocab['word2count']
+        index2word = vocab['index2word']
+        n_words = vocab['n_words']
+        self.word2index = word2index
+        self.word2count = word2count
+        self.index2word = index2word
+        self.vocab_size = n_words
+        self.word_freq = np.zeros(self.vocab_size)
+        self.is_eval = is_eval
+        self.rels = ["x_intent", "x_need", "x_want", "x_effect", "x_react"]
+        #             batch["x_need"]
+        self.embedding = share_embedding(args, n_words, word2index, self.args.pretrain_emb)  # args, n_words, word2index
+
+        self.encoder = Encoder(args, self.args.emb_dim, self.args.hidden_dim, num_layers=self.args.hop,
+                               num_heads=self.args.heads, total_key_depth=self.args.depth,
+                               total_value_depth=self.args.depth,
+                               max_length=args.max_seq_length, filter_size=self.args.filter,
+                               universal=self.args.universal)
+        self.emo_encoder = Encoder(args, self.args.emb_dim, self.args.hidden_dim, num_layers=self.args.hop,
+                               num_heads=self.args.heads, total_key_depth=self.args.depth,
+                               total_value_depth=self.args.depth,
+                               max_length=args.max_seq_length, filter_size=self.args.filter,
+                               universal=self.args.universal)
+        #
+        # 情绪编码
+        self.cog_encoder = Encoder(args, self.args.emb_dim, self.args.hidden_dim, num_layers=self.args.hop,
+                               num_heads=self.args.heads, total_key_depth=self.args.depth,
+                               total_value_depth=self.args.depth,
+                               max_length=args.max_seq_length, filter_size=self.args.filter,
+                               universal=self.args.universal)
+        # cognitive 认知编码器
+        self.emo_ref_encoder = Encoder(args, 2 * self.args.emb_dim, self.args.hidden_dim, num_layers=self.args.hop,
+                               num_heads=self.args.heads, total_key_depth=self.args.depth,
+                               total_value_depth=self.args.depth,
+                               max_length=args.max_seq_length, filter_size=self.args.filter,
+                               universal=self.args.universal)
+        self.cog_ref_encoder = Encoder(args, 2 * self.args.emb_dim, self.args.hidden_dim, num_layers=self.args.hop,
+                               num_heads=self.args.heads, total_key_depth=self.args.depth,
+                               total_value_depth=self.args.depth,
+                               max_length=args.max_seq_length, filter_size=self.args.filter,
+                               universal=self.args.universal)
+        # 不知道是什么编码器
+        self.map_emo = {0: 'devastated', 1: 'furious', 2: 'angry', 3: 'terrified',
+                        4: 'disgusted', 5: 'afraid', 6: 'sad', 7: 'anxious', 8: 'apprehensive',
+                        9: 'sentimental', 10: 'ashamed', 11: 'guilty', 12: 'annoyed',
+                        13: 'jealous', 14: 'lonely', 15: 'disappointed', 16: 'embarrassed',
+                        17: 'prepared', 18: 'nostalgic', 19: 'caring', 20: 'trusting',
+                        21: 'confident', 22: 'hopeful', 23: 'impressed', 24: 'faithful',
+                        25: 'content', 26: 'anticipating', 27: 'grateful', 28: 'surprised',
+                        29: 'joyful', 30: 'excited', 31: 'proud'}
+        self.cog_lin = MLP()
+        ## GRAPH
+        self.dropout = args.dropout
+        self.W_q = nn.Linear(args.emb_dim, args.emb_dim)
+        #args.emb_dim 嵌入层size
+        self.W_k = nn.Linear(args.emb_dim, args.emb_dim)
+        self.W_v = nn.Linear(args.emb_dim, args.emb_dim)
+        self.graph_out = nn.Linear(args.emb_dim, args.emb_dim)
+        self.graph_layer_norm = LayerNorm(args.hidden_dim)
+
+        ## emotional signal distilling
+        self.identify = nn.Linear(args.emb_dim, decoder_number, bias=False)
+        #32
+        self.activation = nn.Softmax(dim=1)
+
+        ## multiple decoders
+        # print('@@@@@', type(args.emb_dim))
+        # print('111',type(decoder_number))
+        self.emotion_embedding = nn.Linear(decoder_number, args.emb_dim)
+        # print('!!!!',type(args.emb_dim))
+        # self.cog_embedding = nn.Linear(20084,args.emb_dim)
+
+        self.decoder = Decoder(args, args.emb_dim, hidden_size=args.hidden_dim, num_layers=args.hop,
+                               num_heads=args.heads,
+                               total_key_depth=args.depth, total_value_depth=args.depth, filter_size=args.filter,
+                               max_length=args.max_seq_length, )
+
+
+
+        self.decoder_key = nn.Linear(args.hidden_dim, decoder_number, bias=False)
+        self.generator = Generator(args, args.hidden_dim, self.vocab_size)
+        if args.project:
+            self.embedding_proj_in = nn.Linear(args.emb_dim, args.hidden_dim, bias=False)
+        if args.weight_sharing:
+            self.generator.proj.weight = self.embedding.lut.weight
+
+        self.criterion = nn.NLLLoss(ignore_index=args.PAD_idx)
+        if args.label_smoothing:
+            self.criterion = LabelSmoothing(size=self.vocab_size, padding_idx=args.PAD_idx, smoothing=0.1)
+            self.criterion_ppl = nn.NLLLoss(ignore_index=args.PAD_idx)
+
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=args.lr)
+        if args.noam:
+            # We used the Adam optimizer here with β1 = 0.9, β2 = 0.98, and ϵ = 10^−9. We varied the learning rate over the course of training.
+            # This corresponds to increasing the learning rate linearly for the first warmup training steps,
+            # and decreasing it thereafter proportionally to the inverse square root of the step number. We used warmup step = 8000.
+            self.optimizer = NoamOpt(args.hidden_dim, 1, 8000,
+                                     torch.optim.Adam(self.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9))
+
+        if model_file_path is not None:
+            print("loading weights")
+            state = torch.load(model_file_path, map_location=lambda storage, location: storage)
+            self.encoder.load_state_dict(state['encoder_state_dict'])
+            self.decoder.load_state_dict(state['decoder_state_dict'])
+            self.generator.load_state_dict(state['generator_dict'])
+            self.embedding.load_state_dict(state['embedding_dict'])
+            self.decoder_key.load_state_dict(state['decoder_key_state_dict'])
+            if load_optim:
+                self.optimizer.load_state_dict(state['optimizer'])
+            self.eval()
+
+        self.model_dir = args.save_path
+        if not os.path.exists(self.model_dir):
+            os.makedirs(self.model_dir)
+        self.best_path = ""
+
+    def save_model(self, running_avg_ppl, iter, f1_g, f1_b, ent_g, ent_b):
+        state = {
+            'iter': iter,
+            'encoder_state_dict': self.encoder.state_dict(),
+            'decoder_state_dict': self.decoder.state_dict(),
+            'generator_dict': self.generator.state_dict(),
+            'decoder_key_state_dict': self.decoder_key.state_dict(),
+            'embedding_dict': self.embedding.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'current_loss': running_avg_ppl
+        }
+        model_save_path = os.path.join(
+            self.model_dir,
+            'model_{}_{:.4f}_{:.4f}_{:.4f}_{:.4f}_{:.4f}.tar'.format(iter, running_avg_ppl,f1_g, f1_b, ent_g,ent_b))
+        self.best_path = model_save_path
+        torch.save(state, model_save_path)
+
+    def concept_graph(self, context, concept, adjacency_mask):
+        '''
+
+        :param context: (bsz, max_context_len, embed_dim)
+        :param concept: (bsz, max_concept_len, embed_dim)
+        :param adjacency_mask: (bsz, max_context_len, max_context_len + max_concpet_len)
+        :return:
+        '''
+        # target = self.W_sem_emo(context)  # (bsz, max_context_len, emb_dim)
+        # concept = self.W_sem_emo(concept)
+        target = context
+        src = torch.cat((target, concept), dim=1)  # (bsz, max_context_len + max_concept_len, emb_dim)
+
+        # QK attention
+        q = self.W_q(target)  # (bsz, tgt_len, emb_dim)
+        k, v = self.W_k(src), self.W_v(src)  # (bsz, src_len, emb_dim); (bsz, src_len, emb_dim)
+        attn_weights_ori = torch.bmm(q, k.transpose(1, 2))  # batch matrix multiply (bsz, tgt_len, src_len)
+
+        adjacency_mask = adjacency_mask.bool()
+        attn_weights_ori.masked_fill_(
+            adjacency_mask,
+            1e-24
+        )  # mask PAD
+        attn_weights = torch.softmax(attn_weights_ori, dim=-1)  # (bsz, tgt_len, src_len)
+
+        if torch.isnan(attn_weights).sum() != 0:
+            pdb.set_trace()
+
+        attn_weights = F.dropout(attn_weights, p=self.dropout, training=self.training)
+
+        # weigted sum
+        attn = torch.bmm(attn_weights, v)  # (bsz, tgt_len, emb_dim)
+        attn = self.graph_out(attn)
+
+        attn = F.dropout(attn, p=self.dropout, training=self.training)
+        new_context = self.graph_layer_norm(target + attn)
+
+        new_context = torch.cat((new_context, concept), dim=1)
+        return new_context
+
+    def train_one_batch(self, batch, iter, train=True):
+        enc_batch = batch["context_batch"]
+        enc_batch_extend_vocab = batch["context_ext_batch"]
+        enc_vad_batch = batch['context_vad']
+        concept_input = batch["concept_batch"]  # (bsz, max_concept_len)
+        concept_ext_input = batch["concept_ext_batch"]
+        concept_vad_batch = batch['concept_vad_batch']
+        y = []
+        # print('batch[]',batch["x_intent"])
+        #batch["context_batch"]====batch["input_batch"]CEM
+        #
+        oovs = batch["oovs"]
+        max_oov_length = len(sorted(oovs, key=lambda i: len(i), reverse=True)[0])
+        extra_zeros = Variable(torch.zeros((enc_batch.size(0), max_oov_length))).to(self.args.device)
+
+        dec_batch = batch["target_batch"]
+        dec_ext_batch = batch["target_ext_batch"]
+
+        if self.args.noam:
+            self.optimizer.optimizer.zero_grad()
+        else:
+            self.optimizer.zero_grad()
+
+        ## Embedding - context
+        mask_src = enc_batch.data.eq(self.args.PAD_idx).unsqueeze(1)  # (bsz, src_len)->(bsz, 1, src_len)
+
+        mask_src_con = mask_src
+
+        emb_mask = self.embedding(batch["mask_context"])  # dialogue state embedding
+
+        src_emb = self.embedding(enc_batch) + emb_mask
+
+        # =====src_emb
+
+        enc_outputs = self.encoder(src_emb, mask_src)
+
+        src_vad = enc_vad_batch  # (bsz, len, 1)  emotion intensity values
+
+        # Commonsense relations
+        cs_embs = []
+        cs_masks = []
+        cs_outputs = []
+        for r in self.rels:
+            batch[r] = batch[r].to(self.args.device)
+
+            mask = batch[r].data.eq(self.args.PAD_idx).unsqueeze(1)
+            # !!!
+            # mask_src = torch.cat((mask_src, mask), dim=2)
+
+            # !!!
+            emb = self.embedding(batch[r])
+            # to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+            # print('emb',emb)
+
+            cs_masks.append(mask)
+            cs_embs.append(emb)
+
+            if r != "x_react":
+                enc_output = self.cog_encoder(emb, mask)
+            else:
+                enc_output = self.emo_encoder(emb, mask)
+
+            cs_outputs.append(enc_output)
+        # print('cs_mask', len(cs_masks))
+        cls_tokens = [c[:, 0].unsqueeze(1) for c in cs_outputs]
+
+        cog_cls = cls_tokens[:-1]
+
+        dim = [-1, enc_outputs.shape[1], -1]
+        # Cognition
+        cog_outputs = []
+
+        for cls in cog_cls:
+            cog_concat = torch.cat([enc_outputs, cls.expand(dim)], dim=-1)
+            cog_concat_enc = self.cog_ref_encoder(cog_concat, mask_src_con)
+            cog_outputs.append(cog_concat_enc)
+
+        cog_ref_ctx = torch.cat(cog_outputs, dim=-1)
+        cog_contrib = nn.Sigmoid()(cog_ref_ctx)
+        cog_ref_ctx = cog_contrib * cog_ref_ctx
+        cog_ref_ctx = self.cog_lin(cog_ref_ctx)
+
+
+
+
+        # if self.args.model != 'wo_ECE':  # emotional context graph encoding
+        if concept_input.size()[0] != 0:
+            mask_con = concept_input.data.eq(self.args.PAD_idx).unsqueeze(1)  # real mask
+            con_mask = self.embedding(batch["mask_concept"])  # kg embedding
+            con_emb = self.embedding(concept_input) + con_mask
+
+            src_emb = self.concept_graph(src_emb, con_emb, batch["adjacency_mask_batch"])  # (bsz, context+concept, emb_dim)
+            # src_emb组图后的kn
+            mask_src = torch.cat((mask_src, mask_con), dim=2)  # (bsz, 1, context+concept)
+            src_vad = torch.cat((enc_vad_batch, concept_vad_batch), dim=1)  # (bsz, len)
+
+        # for r in range(0,len(cs_masks)):
+        #
+        #     mask_src = torch.cat((mask_src, cs_masks[r]), dim=2)
+        #     # print('src_emb!!cs',src_emb.shape,cs_embs[r].shape)
+        #     src_emb = torch.cat((src_emb, cs_embs[r]), dim=1)
+        # mask_src = torch.cat((mask_src, cs_masks), dim=2)
+        # src_emb = torch.cat((src_emb,cs_embs),dim=2)
+        ## Encode - context & concept
+
+        encoder_outputs = self.encoder(src_emb, mask_src)  # (bsz, src_len, emb_dim)
+        # encoder_outputs_com = self.encoder(src_emb1, mask_src1)
+
+
+
+
+
+        # print('cog_size',cog_ref_ctx.size)
+        # print('cog',cog_ref_ctx)
+        # else:
+        #     cog_ref_ctx = torch.cat(cog_outputs + [emo_ref_ctx], dim=-1)
+        # cog_contrib = nn.Sigmoid()(cog_ref_ctx)
+        # cog_ref_ctx = cog_contrib * cog_ref_ctx
+        # cog_ref_ctx = self.cog_lin(cog_ref_ctx)
+
+        # mask_src==CEM src_mask
+        # !!!!!!!!!!!!!!!!!!!!!!!
+        # 得到了mask_src and cog_ref_ctx
+
+        ## emotional signal distilling
+        src_vad = torch.softmax(src_vad, dim=-1)
+        emotion_context_vad = src_vad.unsqueeze(2)
+        # 扩展维度,dim=2为索引
+        emotion_context_vad = emotion_context_vad.repeat(1, 1, self.args.emb_dim)  # (bsz, len, emb_dim)
+        # print('emo_duibi',emotion_context_vad.shape,encoder_outputs.shape)
+        # pad_size = abs(encoder_outputs.size(1) - emotion_context_vad.size(1))
+        # print('pad',pad_size1)
+        # encoder_outputs = encoder_outputs[:,:emotion_context_vad.shape[1],:]
+        # emotion_context_vad1=emotion_context_vad
+        # emotion_context_vad1 = torch.nn.functional.pad(emotion_context_vad, (0, 0, 0, pad_size, 0, 0))
+        # print('encoder',emotion_context_vad.shape)
+        emotion_context = torch.sum(emotion_context_vad * encoder_outputs, dim=1)  # c_e (bsz, emb_dim)
+        # print('ce',emotion_context.shape)
+        emotion_contexts = emotion_context_vad * encoder_outputs
+
+        emotion_logit = self.identify(emotion_context)  # e_p (bsz, emotion_num)
+        # print('ep',emotion_logit.shape)
+        # 对角矩阵
+        loss_emotion = nn.CrossEntropyLoss(reduction='sum')(emotion_logit, batch['emotion_label'])
+
+        pred_emotion = np.argmax(emotion_logit.detach().cpu().numpy(), axis=1)
+        # print('pred',pred_emotion)
+
+
+
+        # def get_mse(records_real, records_predict):
+        #     """
+        #     均方误差 估计值与真值 偏差
+        #     """
+        #     if len(records_real) == len(records_predict):
+        #         return pow(sum([(x - y) ** 2 for x, y in zip(records_real, records_predict)]),0.5) / len(records_real)
+        #     else:
+        #         return None
+        # mse = [[], [], [], [], [], [], [], []]
+        # #计算所有的均方误差
+        # for i in range(len(batch["emotion_label"].cpu().numpy())):
+        #     for j in range(len(dict)):
+        #         b = np.random.normal(loc=0.09, scale=0.02, size=None)
+        #         mse[i].append(abs(get_mse(dict[str(batch["emotion_label"].cpu().numpy()[i])], dict[str(j)])-b))
+        #
+        # pred_emotion = []
+
+
+        # def indexofMin(arr):
+        #     minindex = 0
+        #     currentindex = 1
+        #     while currentindex < len(arr):
+        #         if arr[currentindex] < arr[minindex]:
+        #             minindex = currentindex
+        #         currentindex += 1
+        #     return minindex
+        #
+        # for i in range(len(mse)):
+        #     pred_emotion.append(indexofMin(mse[i]))
+        #     # print('zuixiaosuoyin',indexofMin(mse[i]))
+        # pred_emotion=np.array(pred_emotion)
+        # print('pred',pred_emotion,pred_emotion.ndim)
+
+        ######################################################
+
+
+
+
+        # f1 = open('mse.txt', 'a')
+        # print('true', batch["emotion_label"].cpu().numpy(),'\n',file=f1)
+        # print('pred', pred_emotion, '\n', file=f1)
+
+        #取出前四种情绪
+        # temp=emotion_logit.detach().cpu().numpy()
+        #
+        # for i in range(len(temp)):
+        #     temp[i]=np.argsort(temp[i])[::-1]
+        #
+        # less_temp = [list(item[:4]) for item in temp]
+        #
+        # for i in range(len(less_temp)):
+        #     for j in range(len(less_temp[i])):
+        #         less_temp[i][j] = int(less_temp[i][j])
+        #
+
+        # print('less:',less_temp)
+        # print(emotion_logit.detach().cpu().numpy())
+        # detach阻断反向传播，返回值仍为tensor，cpu()将变量放在cpu上，仍为tensor：numpy()将tensor转换为numpy：
+        # 函数功能，返回最大值的索引；若axis = 1，表明按行比较，输出每行中最大值的索引，若axis = 0，则输出每列中最大值的索引。
+
+        #
+        # print('biaoqian',batch["emotion_label"].cpu().numpy(),'\n',batch["emotion_label"].cpu().numpy().shape,batch["emotion_label"].cpu().numpy().ndim)
+        # print(pred_emotion)
+        emotion_acc = accuracy_score(batch["emotion_label"].cpu().numpy(), pred_emotion)
+        # print('-------------------------------------------------------------')
+        # if batch["emotion_label"].cpu().numpy().shape[0] == 8:
+        #     emotion_acc = accuracy_score(batch["emotion_label"].cpu().numpy(), pred_emotion)
+        #     # print(emotion_acc)
+        # elif batch["emotion_label"].cpu().numpy().shape[0] > 0:
+        #     emotion_acc = accuracy_score(batch["emotion_label"].cpu().numpy(), pred_emotion[:batch["emotion_label"].cpu().numpy().shape[0]])
+        # else:
+        #     emotion_acc = 0
+        # emotion_acc = accuracy_score(batch["emotion_label"].cpu().numpy(),pred_emotion[:batch["emotion_label"].cpu().numpy().shape[0]])
+            # print(emotion_acc)
+
+
+        # print('-------------------------------------------------------------')
+        # print(batch["emotion_label"].cpu().numpy())
+        # print("pred_emotion", pred_emotion)
+        # print(emotion_logit.detach().cpu().numpy())
+        # print('old_pred_acc',emotion_acc,'\n',file=f1)
+        # def long(records_real):
+        #     """
+        #     长度
+        #     """
+        #
+        #     return pow(sum([x ** 2 for x in records_real]),0.5) / len(records_real)
+        #
+        # mse_temp = 0
+        # mse_result = 0
+        # acc_num = 0
+        # 修改acc的算法
+        # for i in range(len(batch["emotion_label"].cpu().numpy())):
+        #     mse_temp = get_mse(dict[str(batch["emotion_label"].cpu().numpy()[i])], dict[str(pred_emotion[i])])
+        #     # print(mse_temp)
+        #     if mse_temp < 0.1:
+        #         acc_num += 1
+        #         # print(acc_num)
+        # emotion_acc = acc_num / len(batch["emotion_label"].cpu().numpy())
+
+        # print(emotion_acc)
+
+
+        #true的长度
+        # true_long=0
+        # for i in range(len(batch["emotion_label"].cpu().numpy())):
+        #     true_long=true_long+(long(dict[str(batch["emotion_label"].cpu().numpy()[i])]))/len(batch["emotion_label"].cpu().numpy())
+        # self.true_result+=true_long
+        #  pred和true的mse距离
+        # mse_temp=0
+        # for i in range(len(batch["emotion_label"].cpu().numpy())):
+        #     mse_temp = mse_temp + (get_mse(dict[str(batch["emotion_label"].cpu().numpy()[i])], dict[str(pred_emotion[i])]))/len(pred_emotion)
+        # self.mse_result += mse_temp
+        # f3 = open('mse_temp.txt', 'a')
+        # print('mse_temp:',mse_temp,'\n',file=f3)
+
+        #对前四个emotion，按不同权重取VAD均值，得到一个VAD值，与所有情绪的VAD做均方误差
+
+        #按照0.5，0.25，0.15，0.1
+        # pred_mse = [[0, 0, 0],[0, 0, 0],[0, 0, 0],[0, 0, 0],[0, 0, 0],[0, 0, 0],[0, 0, 0],[0, 0, 0]]
+        # for i in range(len(less_temp)):
+        #     for item in range(len(less_temp[i])):
+        #         if item == 0:
+        #             pred_mse[i] = pred_mse[i] + np.array([a * 0.5 for a in dict[str(less_temp[i][item])]])
+        #         if item == 1:
+        #             pred_mse[i] = pred_mse[i] + np.array([a * 0.25 for a in dict[str(less_temp[i][item])]])
+        #         if item == 2:
+        #             pred_mse[i] = pred_mse[i] + np.array([a * 0.15 for a in dict[str(less_temp[i][item])]])
+        #         if item == 3:
+        #             pred_mse[i] = pred_mse[i] + np.array([a * 0.1 for a in dict[str(less_temp[i][item])]])
+        # print(pred_mse)
+
+        # 将VAD的加权平均值与所有emotion的VAD对比，得到均方误差最小的emotion作为predemotion
+        # new_temp = []
+        # new_pred_emotion = []
+        #
+        # for i in range(len(pred_mse)):
+        #     temp_result = []
+        #     for item in dict:
+        #         temp_result.append(get_mse(pred_mse[i], dict[str(item)]))
+        #     new_temp.append(temp_result)
+        #
+        # for i in range(len(new_temp)):
+        #     new_pred_emotion = np.argmin(new_temp, axis=1)
+        #
+        # print('new_emotion', new_pred_emotion,'\n',file=f1)
+        # # print('new_acc',emotion_acc11, '\n', file=f1)
+        # print('less_4',less_temp,'\n',file=f1)
+        # # print('mse',final_result,'\n',file=f1)
+
+
+        #
+
+        # Decode
+        # print('emo',emotion_logit,emotion_logit.shape)
+        # print('cog',cog_ref_ctx,cog_ref_ctx.shape)
+        sos_emb = self.emotion_embedding(emotion_logit).unsqueeze(1)  # (bsz, 1, emb_dim)
+        # print('sos',sos_emb.shape)
+        dec_emb = self.embedding(dec_batch[:, :-1])  # (bsz, tgt_len, emb_dim)
+        # print('dec',dec_emb.shape)
+        # cog_ref_ctx = self.cog_embedding(cog_ref_ctx)
+        # min_value = torch.min(cog_ref_ctx)
+        # max_value = torch.max(cog_ref_ctx)
+        # print("最小值:", min_value.item())
+        # print("最大值:", max_value.item())
+
+
+        # weight = torch.randn(1200, 300)
+        # weight = weight.to(self.args.device)
+        # cog_ref_ctx = torch.matmul(cog_ref_ctx, weight)
+
+        # cog_ref_ctx = cog_ref_ctx.long()
+        # cog_emb = self.embedding(cog_ref_ctx)
+        dec_emb = torch.cat((sos_emb,dec_emb), dim=1)  # (bsz, tgt_len, emb_dim)
+        # print('dec2',dec_emb.shape)
+        # print('cog',cog_ref_ctx.shape)
+        # cog_ref_ctx = cog_ref_ctx.expand(cog_ref_ctx.size(0), dec_emb.size(1), cog_ref_ctx.size(2))
+        # dec_emb = torch.stack([cog_ref_ctx,dec_emb],dim=2)
+        # dec_emb = torch.cat((cog_ref_ctx,dec_emb),dim=1)
+        # print('dec3',dec_emb.shape)
+
+        mask_trg = dec_batch.data.eq(self.args.PAD_idx).unsqueeze(1)
+        # print('dec_batch',dec_batch)
+        # print('mask',mask_src.shape,mask_trg.shape)
+        if "wo_EDD" in self.args.model:
+            pre_logit, attn_dist, loss_attn = self.decoder(inputs=dec_emb,
+                                                           encoder_output=encoder_outputs,
+                                                           mask=(mask_src, mask_trg),
+                                                           pred_emotion=None,
+                                                           emotion_contexts=None,
+                                                           cog_ref_ctx = None)
+        else:
+            pre_logit, attn_dist, loss_attn = self.decoder(inputs=dec_emb,
+                                                           encoder_output=encoder_outputs,
+                                                           mask=(mask_src, mask_trg),
+                                                           pred_emotion=None,
+                                                           emotion_contexts=emotion_context,
+                                                           context_vad=src_vad,
+                                                           cog_ref_ctx = cog_ref_ctx)
+
+
+        ## compute output dist
+        if self.args.model != 'wo_ECE':  # emotional context graph encoding
+            if concept_input.size()[0] != 0:
+                enc_batch_extend_vocab = torch.cat((enc_batch_extend_vocab, concept_ext_input), dim=1)
+        logit = self.generator(pre_logit, None, None, attn_dist,
+                               enc_batch_extend_vocab if self.args.pointer_gen else None, extra_zeros)
+        loss = self.criterion(logit.contiguous().view(-1, logit.size(-1)),
+                              dec_batch.contiguous().view(
+                                  -1) if self.args.pointer_gen else dec_ext_batch.contiguous().view(-1))
+        loss += loss_emotion
+        if self.args.attn_loss and self.args.model != "wo_EDD":
+            loss += (0.1 * loss_attn)
+
+        loss_ppl = 0.0
+        if self.args.label_smoothing:
+
+            loss_ppl = self.criterion_ppl(logit.contiguous().view(-1, logit.size(-1)),
+                                          dec_batch.contiguous().view(
+                                              -1) if self.args.pointer_gen else dec_ext_batch.contiguous().view(
+                                              -1)).item()
+        #ctx_loss
+        if torch.sum(torch.isnan(loss)) != 0:
+            print('loss is NAN :(')
+            pdb.set_trace()
+
+        if train:
+            loss.backward()
+            self.optimizer.step()
+
+        comet_res = {}
+
+        if self.is_eval:
+
+            for r in self.rels:
+                txt = [[" ".join(t) for t in tm] for tm in batch[f"{r}_txt"]][0]
+                comet_res[r] = txt
+
+
+        if self.args.label_smoothing:
+            return loss_ppl, math.exp(min(loss_ppl, 100)), loss_emotion.item(), emotion_acc,comet_res
+            # return loss_ppl, math.exp(min(loss_ppl, 100)), loss_emotion.item(), emotion_acc, self.mse_result, self.true_result
+
+        else:
+            # return loss.item(), math.exp(min(loss.item(), 100)), 0, 0, self.mse_result,self.true_result
+            return loss.item(),math.exp(min(loss.item(), 100)),0,0,comet_res
+
+
+    def compute_act_loss(self, module):
+        R_t = module.remainders
+        N_t = module.n_updates
+        p_t = R_t + N_t
+        avg_p_t = torch.sum(torch.sum(p_t, dim=1) / p_t.size(1)) / p_t.size(0)
+        loss = self.args.act_loss_weight * avg_p_t.item()
+        return loss
+
+    def decoder_greedy(self, batch, max_dec_step=30):
+        enc_batch_extend_vocab, extra_zeros = None, None
+        enc_batch = batch["context_batch"]
+        enc_vad_batch = batch['context_vad']
+        enc_batch_extend_vocab = batch["context_ext_batch"]
+
+        concept_input = batch["concept_batch"]  # (bsz, max_concept_len)
+        concept_ext_input = batch["concept_ext_batch"]
+        concept_vad_batch = batch['concept_vad_batch']
+        oovs = batch["oovs"]
+        max_oov_length = len(sorted(oovs, key=lambda i: len(i), reverse=True)[0])
+        extra_zeros = Variable(torch.zeros((enc_batch.size(0), max_oov_length))).to(self.args.device)
+
+        ## Encode - context
+        mask_src = enc_batch.data.eq(self.args.PAD_idx).unsqueeze(1)  # (bsz, src_len)->(bsz, 1, src_len)
+        emb_mask = self.embedding(batch["mask_context"])
+        src_emb = self.embedding(enc_batch) + emb_mask
+        src_vad = enc_vad_batch  # (bsz, len, 1)
+
+        if self.args.model != 'wo_ECE':  # emotional context graph encoding
+            if concept_input.size()[0] != 0:
+                mask_con = concept_input.data.eq(self.args.PAD_idx).unsqueeze(1)  # real mask
+                con_mask = self.embedding(batch["mask_concept"])  # dialogue state
+                con_emb = self.embedding(concept_input) + con_mask
+
+                ## Knowledge Update
+                src_emb = self.concept_graph(src_emb, con_emb,
+                                             batch["adjacency_mask_batch"])  # (bsz, context+concept, emb_dim)
+                mask_src = torch.cat((mask_src, mask_con), dim=2)  # (bsz, 1, context+concept)
+
+                src_vad = torch.cat((enc_vad_batch, concept_vad_batch), dim=1)  # (bsz, len)
+        encoder_outputs = self.encoder(src_emb, mask_src)  # (bsz, src_len, emb_dim)
+
+        ## Identify
+        src_vad = torch.softmax(src_vad, dim=-1)
+        emotion_context_vad = src_vad.unsqueeze(2)
+        emotion_context_vad = emotion_context_vad.repeat(1, 1, self.args.emb_dim)  # (bsz, len, emb_dim)
+        emotion_context = torch.sum(emotion_context_vad * encoder_outputs, dim=1)  # c_e (bsz, emb_dim)
+        emotion_contexts = emotion_context_vad * encoder_outputs
+
+        emotion_logit = self.identify(emotion_context)  # (bsz, emotion_num)
+
+        if concept_input.size()[0] != 0 and self.args.model != 'wo_ECE':
+            enc_ext_batch = torch.cat((enc_batch_extend_vocab, concept_ext_input), dim=1)
+        else:
+            enc_ext_batch = enc_batch_extend_vocab
+
+        ys = torch.ones(1, 1).fill_(self.args.SOS_idx).long()
+        ys_emb = self.emotion_embedding(emotion_logit).unsqueeze(1)  # (bsz, 1, emb_dim)
+        sos_emb = ys_emb
+        if self.args.USE_CUDA:
+            ys = ys.cuda()
+        mask_trg = ys.data.eq(self.args.PAD_idx).unsqueeze(1)
+        decoded_words = []
+        for i in range(max_dec_step + 1):
+            if self.args.project:
+                out, attn_dist, _ = self.decoder(self.embedding_proj_in(ys_emb),
+                                                 self.embedding_proj_in(encoder_outputs), (mask_src, mask_trg))
+            else:
+                out, attn_dist, _ = self.decoder(inputs=ys_emb,
+                                                 encoder_output=encoder_outputs,
+                                                 mask=(mask_src, mask_trg),
+                                                 pred_emotion=None,
+                                                 emotion_contexts=emotion_context,
+                                                 context_vad=src_vad)
+
+            prob = self.generator(out, None, None, attn_dist, enc_ext_batch if self.args.pointer_gen else None,
+                                  extra_zeros)
+            _, next_word = torch.max(prob[:, -1], dim=1)
+            decoded_words.append(
+                ['<EOS>' if ni.item() == self.args.EOS_idx else self.index2word[str(ni.item())] for ni in
+                 next_word.view(-1)])
+            next_word = next_word.data[0]
+
+            if self.args.use_cuda:
+                ys = torch.cat([ys, torch.ones(1, 1).long().fill_(next_word).cuda()], dim=1)
+                ys = ys.cuda()
+                ys_emb = torch.cat((ys_emb, self.embedding(torch.ones(1, 1).long().fill_(next_word).cuda())), dim=1)
+            else:
+                ys = torch.cat([ys, torch.ones(1, 1).long().fill_(next_word)], dim=1)
+                ys_emb = torch.cat((ys_emb, self.embedding(torch.ones(1, 1).long().fill_(next_word))), dim=1)
+            mask_trg = ys.data.eq(self.args.PAD_idx).unsqueeze(1)
+
+        sent = []
+        for _, row in enumerate(np.transpose(decoded_words)):
+            st = ''
+            for e in row:
+                if e == '<EOS>':
+                    break
+                else:
+                    st += e + ' '
+            sent.append(st)
+        return sent
